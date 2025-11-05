@@ -311,21 +311,33 @@ def pick_first_present(paths: list[Path]) -> Path | None:
             return p
     return None
 
-def load_uploaded_df(file) -> Optional[pd.DataFrame]:
+def load_uploaded_df(file_or_df) -> Optional[pd.DataFrame]:
+    """
+    업로더 파일 객체든, 이미 읽어둔 DataFrame이든 모두 처리.
+    필수 컬럼 확인 + 기본 정규화 수행.
+    """
     try:
-        df = pd.read_excel(file)
+        if isinstance(file_or_df, pd.DataFrame):
+            df = file_or_df.copy()
+        else:
+            df = pd.read_excel(file_or_df)
+
         if OPTION_NAME_COL not in df.columns:
             st.error(f"엑셀에 '{OPTION_NAME_COL}' 컬럼이 필요합니다.")
             return None
+
         name_col = find_product_name_col(df)
         if not name_col:
             st.error(f"제품명 컬럼이 필요합니다. 후보: {', '.join(PRODUCT_NAME_CANDIDATES)}")
             return None
+
         df[name_col] = df[name_col].map(normalize_text)
         df[OPTION_NAME_COL] = df[OPTION_NAME_COL].map(normalize_text)
         return df
+
     except Exception as e:
-        st.exception(e); return None
+        st.exception(e)
+        return None
 
 def sheets_from_upload(file):
     if not file:
@@ -544,7 +556,7 @@ def main():
         except Exception as e:
             st.warning(f"레포 템플릿 바이트 읽기 실패: {e}")
     if not template_bytes:
-        # DataFrame dict로 대체 템플릿 (서식 최소) — 가능하면 레포 템플릿 사용 권장
+        # 최소 대체 템플릿 (서식 없음) — 가능하면 레포 템플릿 사용 권장
         try:
             wb = Workbook()
             ws = wb.active
@@ -555,32 +567,20 @@ def main():
             st.error("템플릿 바이트 생성 실패"); st.stop()
     st.session_state["template_bytes"] = template_bytes
 
-    # 상품리스트 탭 준비
+    # 상품리스트 탭 준비(레포/업로드 중 존재하는 것만)
     tabs: List[Tuple[str, pd.DataFrame]] = []
     if jundi_sheets:
-        # 첫 시트 사용
         name = next(iter(jundi_sheets.keys()))
-        df = jundi_sheets[name]
-        df = load_uploaded_df(io.BytesIO(df.to_excel(index=False)) if isinstance(df, pd.DataFrame) else df) or df
-        if isinstance(df, pd.DataFrame) and OPTION_NAME_COL in df.columns:
-            tabs.append(("준디", df))
-        else:
-            # 업로드/레포가 바로 DataFrame이면 그대로 검사
-            if isinstance(jundi_sheets[name], pd.DataFrame):
-                df2 = jundi_sheets[name]
-                if OPTION_NAME_COL in df2.columns:
-                    tabs.append(("준디", df2))
+        raw_df = jundi_sheets[name]
+        norm = load_uploaded_df(raw_df)
+        if norm is not None:
+            tabs.append(("준디", norm))
     if jayu_sheets:
         name = next(iter(jayu_sheets.keys()))
-        df = jayu_sheets[name]
-        df = load_uploaded_df(io.BytesIO(df.to_excel(index=False)) if isinstance(df, pd.DataFrame) else df) or df
-        if isinstance(df, pd.DataFrame) and OPTION_NAME_COL in df.columns:
-            tabs.append(("자유", df))
-        else:
-            if isinstance(jayu_sheets[name], pd.DataFrame):
-                df2 = jayu_sheets[name]
-                if OPTION_NAME_COL in df2.columns:
-                    tabs.append(("자유", df2))
+        raw_df = jayu_sheets[name]
+        norm = load_uploaded_df(raw_df)
+        if norm is not None:
+            tabs.append(("자유", norm))
 
     st.write("---")
     if not tabs:
