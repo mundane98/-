@@ -4,8 +4,8 @@ import io
 import math
 import re
 import datetime as dt
-from copy import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
 import pandas as pd
@@ -13,6 +13,11 @@ import streamlit as st
 from openpyxl import load_workbook, Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import PatternFill, Border, Side
+
+# =========================
+# 앱/테마
+# =========================
+st.set_page_config(page_title="브랜드별 템플릿 빌더(클라우드)", layout="wide")
 
 # =========================
 # 상수/스타일
@@ -148,8 +153,7 @@ def extract_colors_sizes(option_series: pd.Series) -> Tuple[List[str], List[str]
 # =========================
 def init_session():
     st.session_state.setdefault("basket", [])
-    st.session_state.setdefault("current_grid", pd.DataFrame())
-    st.session_state.setdefault("current_context", {})
+    st.session_state.setdefault("template_bytes", None)
     st.session_state.setdefault("manual_product", "")
     st.session_state.setdefault("manual_colors_text", "")
     st.session_state.setdefault("manual_size_start", 230)
@@ -209,8 +213,8 @@ def _clear_data_area_keep_row1(ws, start_row=2, start_col=2):
 
 def export_brand_template_xlsx(brand: str, items: List[dict], template_bytes: bytes) -> bytes:
     """
-    - 업로드한 template.xlsx의 1행/서식 보존
-    - B2부터 기록, 제품명은 FFFF00 하이라이트
+    - 템플릿(업로드/레포 파일)의 1행/서식 보존
+    - B2부터 기록, 제품명 하이라이트(FFFF00)
     - 제품별 '실사용 사이즈'만 가로 헤더(C~) 생성, C열 이후 너비=4
     """
     try:
@@ -288,8 +292,25 @@ def export_brand_template_xlsx(brand: str, items: List[dict], template_bytes: by
     return out.getvalue()
 
 # =========================
-# 데이터 로드 & 검색
+# 레포 파일 자동 인식 + 업로드 대체
 # =========================
+@st.cache_data(show_spinner=False)
+def read_local_excel_sheets(path: Path | None):
+    if not path or not path.exists():
+        return None
+    try:
+        xls = pd.ExcelFile(path)
+        return {s: pd.read_excel(xls, sheet_name=s) for s in xls.sheet_names}
+    except Exception as e:
+        st.warning(f"레포 파일 읽기 실패({path.name}): {e}")
+        return None
+
+def pick_first_present(paths: list[Path]) -> Path | None:
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
 def load_uploaded_df(file) -> Optional[pd.DataFrame]:
     try:
         df = pd.read_excel(file)
@@ -306,6 +327,20 @@ def load_uploaded_df(file) -> Optional[pd.DataFrame]:
     except Exception as e:
         st.exception(e); return None
 
+def sheets_from_upload(file):
+    if not file:
+        return None
+    try:
+        if file.name.lower().endswith(".csv"):
+            return {"Sheet1": pd.read_csv(file)}
+        return {s: pd.read_excel(file, sheet_name=s) for s in pd.ExcelFile(file).sheet_names}
+    except Exception as e:
+        st.error(f"업로드 파일 읽기 실패: {e}")
+        return None
+
+# =========================
+# 검색/그리드 빌더
+# =========================
 def search_products(df: pd.DataFrame, keyword: str, name_col: str) -> pd.DataFrame:
     if not keyword:
         return df[[name_col]].drop_duplicates().head(200)
@@ -320,7 +355,7 @@ def _sizes_range_step(start: int, end: int, step: int) -> List[str]:
 # =========================
 # 탭 본문
 # =========================
-def tab_body(brand: str, df: pd.DataFrame, template_bytes: bytes):
+def tab_body(brand: str, df: pd.DataFrame):
     name_col = find_product_name_col(df)
 
     st.subheader(f"{brand} — 제품명 검색")
@@ -438,66 +473,124 @@ def tab_body(brand: str, df: pd.DataFrame, template_bytes: bytes):
         st.caption("아직 추가된 항목이 없습니다.")
     else:
         st.dataframe(pd.DataFrame(basket), use_container_width=True, height=280)
-        xlsx_bytes = export_brand_template_xlsx(brand, basket, st.session_state["template_bytes"])
-        fname = f"{brand}_{dt.datetime.now():%Y%m%d}_template.xlsx"
-        st.download_button(
-            f"{brand} 템플릿 다운로드 (xlsx)",
-            data=xlsx_bytes,
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+        if not st.session_state["template_bytes"]:
+            st.error("template.xlsx 바이트가 없습니다. 좌측/레포에서 템플릿을 제공해 주세요.")
+        else:
+            xlsx_bytes = export_brand_template_xlsx(brand, basket, st.session_state["template_bytes"])
+            fname = f"{brand}_{dt.datetime.now():%Y%m%d}_template.xlsx"
+            st.download_button(
+                f"{brand} 템플릿 다운로드 (xlsx)",
+                data=xlsx_bytes,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
 
 # =========================
 # 메인
 # =========================
 def main():
-    st.set_page_config(page_title="브랜드별 템플릿 빌더(클라우드)", layout="wide")
     init_session()
 
-    st.title("TXT 없이 바로 템플릿 만들기 (브랜드별 파일, 클라우드 업로드 버전)")
+    st.title("TXT 없이 바로 템플릿 만들기 (브랜드별 파일 · 클라우드)")
     st.caption("템플릿 보존 · B2부터 기록 · 제품명 하이라이트=FFFF00 · 제품별 가변 사이즈 헤더 · C열부터 너비=4 고정")
 
-    with st.expander("업로드 안내", expanded=True):
-        st.markdown(
-            """
-            1) **template.xlsx**: 출력 서식/머리글/인쇄설정으로 사용할 템플릿 파일  
-            2) **준디 상품리스트.xlsx**, **자유 상품리스트.xlsx**: 각 파일에 **'등록 옵션명'** 컬럼이 있어야 합니다.  
-            - 제품명 컬럼은 자동 인식(후보: 등록상품명/상품명/노출상품명/쿠팡노출상품명)
-            - 색상 표기는 자동 치환: 블랙→흑, 화이트→백, 여성→中, 남성→大
-            """
-        )
+    # --- 레포 경로 자동 인식 ---
+    base = Path(__file__).parent
+    data_dir = base / "data"
+    tpl_path   = None
+    jundi_path = None
+    jayu_path  = None
+    if data_dir.exists():
+        tpl_path   = pick_first_present([data_dir / "template.xlsx"])
+        jundi_path = pick_first_present([data_dir / "jundi.xlsx"])
+        jayu_path  = pick_first_present([data_dir / "jayu.xlsx"])
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        template_file = st.file_uploader("template.xlsx 업로드", type=["xlsx"], key="tpl")
-    with c2:
-        jundi_file = st.file_uploader("준디 상품리스트 업로드", type=["xlsx"], key="jundi")
-    with c3:
-        jayu_file  = st.file_uploader("자유 상품리스트 업로드", type=["xlsx"], key="jayu")
+    local_tpl_sheets   = read_local_excel_sheets(tpl_path)    if tpl_path   else None
+    local_jundi_sheets = read_local_excel_sheets(jundi_path)  if jundi_path else None
+    local_jayu_sheets  = read_local_excel_sheets(jayu_path)   if jayu_path  else None
 
-    if not template_file:
-        st.info("template.xlsx를 업로드해 주세요."); return
-    st.session_state["template_bytes"] = template_file.read()
+    # --- 사이드바 (현황 + 업로드로 덮어쓰기) ---
+    with st.sidebar:
+        st.header("📁 데이터 소스")
+        def status(label, ok, path: Path | None):
+            p = (str(path.relative_to(base)) if path else label)
+            return f"✅ {p}" if ok else f"⛔ {p} (없음)"
 
-    tabs = []
-    if jundi_file:
-        df_jundi = load_uploaded_df(jundi_file)
-        if df_jundi is not None:
-            tabs.append(("준디", df_jundi))
-    if jayu_file:
-        df_jayu = load_uploaded_df(jayu_file)
-        if df_jayu is not None:
-            tabs.append(("자유", df_jayu))
+        st.caption(status("data/template.xlsx",   bool(local_tpl_sheets),   tpl_path))
+        st.caption(status("data/jundi.xlsx",     bool(local_jundi_sheets),  jundi_path))
+        st.caption(status("data/jayu.xlsx",      bool(local_jayu_sheets),   jayu_path))
 
-    if not tabs:
-        st.warning("좌측 파일 업로드 후 탭이 나타납니다."); return
+        st.write("---")
+        st.write("**업로드로 대체/보완**")
+        tpl_up   = st.file_uploader("template.xlsx", type=["xlsx"], key="tpl_up")
+        jundi_up = st.file_uploader("준디 상품리스트", type=["xlsx"], key="jundi_up")
+        jayu_up  = st.file_uploader("자유 상품리스트", type=["xlsx"], key="jayu_up")
+
+    # 업로드 → 시트 dict
+    tpl_sheets   = sheets_from_upload(tpl_up)   or local_tpl_sheets
+    jundi_sheets = sheets_from_upload(jundi_up) or local_jundi_sheets
+    jayu_sheets  = sheets_from_upload(jayu_up)  or local_jayu_sheets
+
+    if not tpl_sheets:
+        st.warning("template.xlsx가 필요합니다. 레포 data/에 올리거나 업로드하세요.")
+        st.stop()
+
+    # 템플릿 바이트(레포 파일 우선)
+    template_bytes = None
+    if tpl_path and tpl_path.exists():
+        try:
+            template_bytes = tpl_path.read_bytes()
+        except Exception as e:
+            st.warning(f"레포 템플릿 바이트 읽기 실패: {e}")
+    if not template_bytes:
+        # DataFrame dict로 대체 템플릿 (서식 최소) — 가능하면 레포 템플릿 사용 권장
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws["A1"] = "TEMPLATE_PLACEHOLDER"
+            bio = io.BytesIO(); wb.save(bio)
+            template_bytes = bio.getvalue()
+        except Exception:
+            st.error("템플릿 바이트 생성 실패"); st.stop()
+    st.session_state["template_bytes"] = template_bytes
+
+    # 상품리스트 탭 준비
+    tabs: List[Tuple[str, pd.DataFrame]] = []
+    if jundi_sheets:
+        # 첫 시트 사용
+        name = next(iter(jundi_sheets.keys()))
+        df = jundi_sheets[name]
+        df = load_uploaded_df(io.BytesIO(df.to_excel(index=False)) if isinstance(df, pd.DataFrame) else df) or df
+        if isinstance(df, pd.DataFrame) and OPTION_NAME_COL in df.columns:
+            tabs.append(("준디", df))
+        else:
+            # 업로드/레포가 바로 DataFrame이면 그대로 검사
+            if isinstance(jundi_sheets[name], pd.DataFrame):
+                df2 = jundi_sheets[name]
+                if OPTION_NAME_COL in df2.columns:
+                    tabs.append(("준디", df2))
+    if jayu_sheets:
+        name = next(iter(jayu_sheets.keys()))
+        df = jayu_sheets[name]
+        df = load_uploaded_df(io.BytesIO(df.to_excel(index=False)) if isinstance(df, pd.DataFrame) else df) or df
+        if isinstance(df, pd.DataFrame) and OPTION_NAME_COL in df.columns:
+            tabs.append(("자유", df))
+        else:
+            if isinstance(jayu_sheets[name], pd.DataFrame):
+                df2 = jayu_sheets[name]
+                if OPTION_NAME_COL in df2.columns:
+                    tabs.append(("자유", df2))
 
     st.write("---")
+    if not tabs:
+        st.info("data/jundi.xlsx 또는 data/jayu.xlsx 를 제공하거나 업로드하면 탭이 나타납니다.")
+        return
+
     t_objs = st.tabs([t[0] for t in tabs])
     for tab, (brand, df) in zip(t_objs, tabs):
         with tab:
-            tab_body(brand, df, st.session_state["template_bytes"])
+            tab_body(brand, df)
 
 if __name__ == "__main__":
     main()
